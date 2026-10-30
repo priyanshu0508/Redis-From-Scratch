@@ -4,11 +4,13 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 public class Main {
     // Record to store a value along with an optional expiration timestamp (in milliseconds)
@@ -20,6 +22,9 @@ public class Main {
 
     // Thread-safe in-memory key-value database supporting TTL expiration
     private static final Map<String, ValueEntry> database = new ConcurrentHashMap<>();
+
+    // Thread-safe in-memory list database for LPUSH, RPUSH, LRANGE
+    private static final Map<String, Deque<String>> listDatabase = new ConcurrentHashMap<>();
 
     // Thread-safe list of all connected replica output streams for command propagation
     private static final List<OutputStream> replicaStreams = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -375,7 +380,7 @@ public class Main {
                     database.remove(key);
                     entry = null;
                 }
-                int exists = (entry != null) ? 1 : 0;
+                int exists = (entry != null || listDatabase.containsKey(key)) ? 1 : 0;
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled EXISTS " + key + " -> " + exists);
                 return ":" + exists + "\r\n";
             }
@@ -385,6 +390,9 @@ public class Main {
                     String key = tokens.get(i);
                     ValueEntry removed = database.remove(key);
                     if (removed != null && !removed.isExpired()) {
+                        deletedCount++;
+                    }
+                    if (listDatabase.remove(key) != null) {
                         deletedCount++;
                     }
                 }
@@ -403,12 +411,74 @@ public class Main {
                         activeKeys.add(e.getKey());
                     }
                 }
+                // Add keys from listDatabase
+                activeKeys.addAll(listDatabase.keySet());
+
                 StringBuilder resp = new StringBuilder();
                 resp.append("*").append(activeKeys.size()).append("\r\n");
                 for (String k : activeKeys) {
                     resp.append("$").append(k.length()).append("\r\n").append(k).append("\r\n");
                 }
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled KEYS -> returned " + activeKeys.size() + " key(s)");
+                return resp.toString();
+            }
+            case "LPUSH" -> {
+                String key = tokens.get(1);
+                Deque<String> deque = listDatabase.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>());
+                for (int i = 2; i < tokens.size(); i++) {
+                    deque.addFirst(tokens.get(i));
+                }
+                if (role.equals("master")) {
+                    propagateToReplicas(tokens);
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled LPUSH " + key + " -> length " + deque.size());
+                return ":" + deque.size() + "\r\n";
+            }
+            case "RPUSH" -> {
+                String key = tokens.get(1);
+                Deque<String> deque = listDatabase.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>());
+                for (int i = 2; i < tokens.size(); i++) {
+                    deque.addLast(tokens.get(i));
+                }
+                if (role.equals("master")) {
+                    propagateToReplicas(tokens);
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled RPUSH " + key + " -> length " + deque.size());
+                return ":" + deque.size() + "\r\n";
+            }
+            case "LRANGE" -> {
+                String key = tokens.get(1);
+                int start = Integer.parseInt(tokens.get(2));
+                int stop = Integer.parseInt(tokens.get(3));
+                Deque<String> deque = listDatabase.get(key);
+
+                if (deque == null || deque.isEmpty()) {
+                    return "*0\r\n";
+                }
+
+                List<String> list = new ArrayList<>(deque);
+                int size = list.size();
+
+                // Convert negative indices
+                if (start < 0) start = size + start;
+                if (stop < 0) stop = size + stop;
+
+                // Clamp to list bounds
+                if (start < 0) start = 0;
+                if (stop >= size) stop = size - 1;
+
+                if (start > stop || start >= size) {
+                    return "*0\r\n";
+                }
+
+                int count = stop - start + 1;
+                StringBuilder resp = new StringBuilder();
+                resp.append("*").append(count).append("\r\n");
+                for (int i = start; i <= stop; i++) {
+                    String item = list.get(i);
+                    resp.append("$").append(item.length()).append("\r\n").append(item).append("\r\n");
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled LRANGE " + key + " " + start + " " + stop + " -> " + count + " item(s)");
                 return resp.toString();
             }
             case "CONFIG" -> {
