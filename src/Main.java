@@ -1,3 +1,8 @@
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.ServerSocket;
@@ -5,6 +10,7 @@ import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
@@ -64,6 +70,11 @@ public class Main {
 
         System.out.println("Logs from your program will appear here!");
         System.out.println("Configuration: port = " + port + ", role = " + role + ", dir = " + dir + ", dbfilename = " + dbfilename);
+
+        // Load existing RDB database snapshot from disk if present
+        if (role.equals("master")) {
+            loadSnapshot();
+        }
 
         // If running as a replica, initiate the handshake with the master server
         if (role.equals("slave") && masterHost != null) {
@@ -558,9 +569,138 @@ public class Main {
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled PSYNC -> +FULLRESYNC " + masterReplId + " 0");
                 return "+FULLRESYNC " + masterReplId + " 0\r\n";
             }
+            case "SAVE" -> {
+                saveSnapshot();
+                return "+OK\r\n";
+            }
             default -> {
                 return "-ERR unknown command '" + command + "'\r\n";
             }
+        }
+    }
+
+    /**
+     * Serializes all in-memory databases (Strings, Lists, Hashes) to a binary RDB file on disk.
+     */
+    private static synchronized void saveSnapshot() {
+        try {
+            File targetFile = new File(dir, dbfilename);
+            if (targetFile.getParentFile() != null) {
+                targetFile.getParentFile().mkdirs();
+            }
+            try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(targetFile))) {
+                // 1. Magic Header
+                dos.writeBytes("REDIS0009");
+
+                // 2. Save active Strings
+                Map<String, ValueEntry> activeStrings = new HashMap<>();
+                for (Map.Entry<String, ValueEntry> e : database.entrySet()) {
+                    if (!e.getValue().isExpired()) {
+                        activeStrings.put(e.getKey(), e.getValue());
+                    }
+                }
+                dos.writeInt(activeStrings.size());
+                for (Map.Entry<String, ValueEntry> e : activeStrings.entrySet()) {
+                    dos.writeUTF(e.getKey());
+                    dos.writeUTF(e.getValue().value());
+                    dos.writeBoolean(e.getValue().expiresAt() != null);
+                    if (e.getValue().expiresAt() != null) {
+                        dos.writeLong(e.getValue().expiresAt());
+                    }
+                }
+
+                // 3. Save Lists
+                dos.writeInt(listDatabase.size());
+                for (Map.Entry<String, Deque<String>> e : listDatabase.entrySet()) {
+                    dos.writeUTF(e.getKey());
+                    List<String> items = new ArrayList<>(e.getValue());
+                    dos.writeInt(items.size());
+                    for (String item : items) {
+                        dos.writeUTF(item);
+                    }
+                }
+
+                // 4. Save Hashes
+                dos.writeInt(hashDatabase.size());
+                for (Map.Entry<String, Map<String, String>> e : hashDatabase.entrySet()) {
+                    dos.writeUTF(e.getKey());
+                    dos.writeInt(e.getValue().size());
+                    for (Map.Entry<String, String> fieldEntry : e.getValue().entrySet()) {
+                        dos.writeUTF(fieldEntry.getKey());
+                        dos.writeUTF(fieldEntry.getValue());
+                    }
+                }
+
+                // 5. EOF marker
+                dos.writeByte(0xFF);
+                dos.flush();
+                System.out.println("[Persistence] Snapshot successfully saved to " + targetFile.getAbsolutePath());
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error saving snapshot: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Reads and restores in-memory state from the RDB file on server startup.
+     */
+    private static synchronized void loadSnapshot() {
+        File sourceFile = new File(dir, dbfilename);
+        if (!sourceFile.exists()) {
+            System.out.println("[Persistence] No existing RDB file found at " + sourceFile.getAbsolutePath() + ", starting fresh.");
+            return;
+        }
+        try (DataInputStream dis = new DataInputStream(new FileInputStream(sourceFile))) {
+            byte[] header = new byte[9];
+            dis.readFully(header);
+            String magic = new String(header);
+            if (!magic.startsWith("REDIS")) {
+                System.out.println("[Persistence] Invalid RDB header: " + magic);
+                return;
+            }
+
+            // 1. Restore Strings
+            int stringCount = dis.readInt();
+            int restoredStrings = 0;
+            for (int i = 0; i < stringCount; i++) {
+                String key = dis.readUTF();
+                String value = dis.readUTF();
+                boolean hasExpiry = dis.readBoolean();
+                Long expiresAt = hasExpiry ? dis.readLong() : null;
+                if (expiresAt == null || expiresAt > System.currentTimeMillis()) {
+                    database.put(key, new ValueEntry(value, expiresAt));
+                    restoredStrings++;
+                }
+            }
+
+            // 2. Restore Lists
+            int listCount = dis.readInt();
+            for (int i = 0; i < listCount; i++) {
+                String key = dis.readUTF();
+                int itemCount = dis.readInt();
+                Deque<String> deque = new ConcurrentLinkedDeque<>();
+                for (int j = 0; j < itemCount; j++) {
+                    deque.add(dis.readUTF());
+                }
+                listDatabase.put(key, deque);
+            }
+
+            // 3. Restore Hashes
+            int hashCount = dis.readInt();
+            for (int i = 0; i < hashCount; i++) {
+                String key = dis.readUTF();
+                int fieldCount = dis.readInt();
+                Map<String, String> map = new ConcurrentHashMap<>();
+                for (int j = 0; j < fieldCount; j++) {
+                    map.put(dis.readUTF(), dis.readUTF());
+                }
+                hashDatabase.put(key, map);
+            }
+
+            System.out.println("[Persistence] Successfully restored from " + sourceFile.getAbsolutePath() +
+                    " (" + restoredStrings + " strings, " + listCount + " lists, " + hashCount + " hashes)");
+        } catch (Exception e) {
+            System.out.println("[Persistence] Could not load RDB file: " + e.getMessage());
         }
     }
 }
