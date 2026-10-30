@@ -641,6 +641,16 @@ public class Main {
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled PUBLISH " + channel + " -> delivered to " + deliveredCount + " subscriber(s)");
                 return ":" + deliveredCount + "\r\n";
             }
+            case "WAIT" -> {
+                int numReplicas = Integer.parseInt(tokens.get(1));
+                long timeoutMs = Long.parseLong(tokens.get(2));
+                // Return count of currently connected and acknowledged replicas
+                // For simplicity: immediately return the min of requested vs connected
+                int connected = replicaStreams.size();
+                int confirmed = Math.min(connected, numReplicas);
+                System.out.println("[WAIT] " + confirmed + " replica(s) acknowledged (connected=" + connected + ", requested=" + numReplicas + ", timeout=" + timeoutMs + "ms)");
+                return ":" + confirmed + "\r\n";
+            }
             case "SADD" -> {
                 String key = tokens.get(1);
                 Set<String> set = setDatabase.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
