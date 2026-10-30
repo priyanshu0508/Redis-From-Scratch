@@ -26,6 +26,9 @@ public class Main {
     // Thread-safe in-memory list database for LPUSH, RPUSH, LRANGE
     private static final Map<String, Deque<String>> listDatabase = new ConcurrentHashMap<>();
 
+    // Thread-safe in-memory hash database for HSET, HGET, HGETALL
+    private static final Map<String, Map<String, String>> hashDatabase = new ConcurrentHashMap<>();
+
     // Thread-safe list of all connected replica output streams for command propagation
     private static final List<OutputStream> replicaStreams = new java.util.concurrent.CopyOnWriteArrayList<>();
 
@@ -380,7 +383,7 @@ public class Main {
                     database.remove(key);
                     entry = null;
                 }
-                int exists = (entry != null || listDatabase.containsKey(key)) ? 1 : 0;
+                int exists = (entry != null || listDatabase.containsKey(key) || hashDatabase.containsKey(key)) ? 1 : 0;
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled EXISTS " + key + " -> " + exists);
                 return ":" + exists + "\r\n";
             }
@@ -393,6 +396,9 @@ public class Main {
                         deletedCount++;
                     }
                     if (listDatabase.remove(key) != null) {
+                        deletedCount++;
+                    }
+                    if (hashDatabase.remove(key) != null) {
                         deletedCount++;
                     }
                 }
@@ -411,8 +417,9 @@ public class Main {
                         activeKeys.add(e.getKey());
                     }
                 }
-                // Add keys from listDatabase
+                // Add keys from listDatabase and hashDatabase
                 activeKeys.addAll(listDatabase.keySet());
+                activeKeys.addAll(hashDatabase.keySet());
 
                 StringBuilder resp = new StringBuilder();
                 resp.append("*").append(activeKeys.size()).append("\r\n");
@@ -420,6 +427,51 @@ public class Main {
                     resp.append("$").append(k.length()).append("\r\n").append(k).append("\r\n");
                 }
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled KEYS -> returned " + activeKeys.size() + " key(s)");
+                return resp.toString();
+            }
+            case "HSET" -> {
+                String key = tokens.get(1);
+                Map<String, String> hash = hashDatabase.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
+                int newFields = 0;
+                for (int i = 2; i + 1 < tokens.size(); i += 2) {
+                    String field = tokens.get(i);
+                    String value = tokens.get(i + 1);
+                    if (hash.put(field, value) == null) {
+                        newFields++;
+                    }
+                }
+                if (role.equals("master")) {
+                    propagateToReplicas(tokens);
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled HSET " + key + " -> " + newFields + " field(s) added");
+                return ":" + newFields + "\r\n";
+            }
+            case "HGET" -> {
+                String key = tokens.get(1);
+                String field = tokens.get(2);
+                Map<String, String> hash = hashDatabase.get(key);
+                String val = (hash != null) ? hash.get(field) : null;
+                if (val != null) {
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled HGET " + key + " " + field + " -> " + val);
+                    return "$" + val.length() + "\r\n" + val + "\r\n";
+                } else {
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled HGET " + key + " " + field + " -> (nil)");
+                    return "$-1\r\n";
+                }
+            }
+            case "HGETALL" -> {
+                String key = tokens.get(1);
+                Map<String, String> hash = hashDatabase.get(key);
+                if (hash == null || hash.isEmpty()) {
+                    return "*0\r\n";
+                }
+                StringBuilder resp = new StringBuilder();
+                resp.append("*").append(hash.size() * 2).append("\r\n");
+                for (Map.Entry<String, String> entry : hash.entrySet()) {
+                    resp.append("$").append(entry.getKey().length()).append("\r\n").append(entry.getKey()).append("\r\n");
+                    resp.append("$").append(entry.getValue().length()).append("\r\n").append(entry.getValue()).append("\r\n");
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled HGETALL " + key + " -> " + hash.size() + " field(s)");
                 return resp.toString();
             }
             case "LPUSH" -> {
