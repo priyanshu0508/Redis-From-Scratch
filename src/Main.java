@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -34,6 +35,9 @@ public class Main {
 
     // Thread-safe in-memory hash database for HSET, HGET, HGETALL
     private static final Map<String, Map<String, String>> hashDatabase = new ConcurrentHashMap<>();
+
+    // Pub/Sub: channel name -> Set of active subscriber OutputStreams
+    private static final Map<String, Set<OutputStream>> channelSubscribers = new ConcurrentHashMap<>();
 
     // Thread-safe list of all connected replica output streams for command propagation
     private static final List<OutputStream> replicaStreams = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -98,6 +102,7 @@ public class Main {
     private static void handleClient(Socket clientSocket) {
         boolean inTransaction = false;
         List<List<String>> transactionQueue = new ArrayList<>();
+        List<String> subscribedChannels = new ArrayList<>();
         OutputStream out = null;
 
         try {
@@ -134,6 +139,26 @@ public class Main {
                     out.flush();
                     replicaStreams.add(out);
                     System.out.println("[Master] Replica registered for propagation. Total active replicas: " + replicaStreams.size());
+                    continue;
+                }
+
+                // Pub/Sub: SUBSCRIBE <channel1> [channel2 ...]
+                if (command.equals("SUBSCRIBE")) {
+                    for (int i = 1; i < tokens.size(); i++) {
+                        String ch = tokens.get(i);
+                        channelSubscribers.computeIfAbsent(ch, k -> ConcurrentHashMap.newKeySet()).add(out);
+                        if (!subscribedChannels.contains(ch)) {
+                            subscribedChannels.add(ch);
+                        }
+                        // Return 3-element RESP Array: ["subscribe", channel, totalSubscribed]
+                        String subResp = "*3\r\n" +
+                                "$9\r\nsubscribe\r\n" +
+                                "$" + ch.length() + "\r\n" + ch + "\r\n" +
+                                ":" + subscribedChannels.size() + "\r\n";
+                        out.write(subResp.getBytes());
+                        out.flush();
+                        System.out.println("[" + Thread.currentThread().getName() + "] Client subscribed to '" + ch + "' (total: " + subscribedChannels.size() + ")");
+                    }
                     continue;
                 }
 
@@ -189,6 +214,13 @@ public class Main {
         } finally {
             if (out != null) {
                 replicaStreams.remove(out);
+                // Unsubscribe client from all channels on disconnect
+                for (String ch : subscribedChannels) {
+                    Set<OutputStream> subs = channelSubscribers.get(ch);
+                    if (subs != null) {
+                        subs.remove(out);
+                    }
+                }
             }
             try {
                 clientSocket.close();
@@ -572,6 +604,35 @@ public class Main {
             case "SAVE" -> {
                 saveSnapshot();
                 return "+OK\r\n";
+            }
+            case "PUBLISH" -> {
+                String channel = tokens.get(1);
+                String message = tokens.get(2);
+                Set<OutputStream> subs = channelSubscribers.get(channel);
+                int deliveredCount = 0;
+
+                if (subs != null && !subs.isEmpty()) {
+                    // RESP Array for message: *3\r\n$7\r\nmessage\r\n$<ch_len>\r\n<ch>\r\n$<msg_len>\r\n<msg>\r\n
+                    String broadcast = "*3\r\n" +
+                            "$7\r\nmessage\r\n" +
+                            "$" + channel.length() + "\r\n" + channel + "\r\n" +
+                            "$" + message.length() + "\r\n" + message + "\r\n";
+                    byte[] payload = broadcast.getBytes();
+
+                    List<OutputStream> deadSubs = new ArrayList<>();
+                    for (OutputStream subOut : subs) {
+                        try {
+                            subOut.write(payload);
+                            subOut.flush();
+                            deliveredCount++;
+                        } catch (IOException e) {
+                            deadSubs.add(subOut);
+                        }
+                    }
+                    subs.removeAll(deadSubs);
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled PUBLISH " + channel + " -> delivered to " + deliveredCount + " subscriber(s)");
+                return ":" + deliveredCount + "\r\n";
             }
             default -> {
                 return "-ERR unknown command '" + command + "'\r\n";
