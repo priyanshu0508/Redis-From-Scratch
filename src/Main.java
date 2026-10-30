@@ -11,8 +11,15 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Main {
-    // Thread-safe in-memory key-value database
-    private static final Map<String, String> database = new ConcurrentHashMap<>();
+    // Record to store a value along with an optional expiration timestamp (in milliseconds)
+    record ValueEntry(String value, Long expiresAt) {
+        boolean isExpired() {
+            return expiresAt != null && System.currentTimeMillis() > expiresAt;
+        }
+    }
+
+    // Thread-safe in-memory key-value database supporting TTL expiration
+    private static final Map<String, ValueEntry> database = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
         int port = 6379;
@@ -84,21 +91,41 @@ public class Main {
             case "SET" -> {
                 String key = tokens.get(1);
                 String value = tokens.get(2);
-                database.put(key, value);
+                Long expiresAt = null;
+
+                // Check for 'PX <milliseconds>' argument
+                for (int i = 3; i < tokens.size(); i++) {
+                    if (tokens.get(i).equalsIgnoreCase("PX") && i + 1 < tokens.size()) {
+                        long ttlMs = Long.parseLong(tokens.get(i + 1));
+                        expiresAt = System.currentTimeMillis() + ttlMs;
+                        break;
+                    }
+                }
+
+                database.put(key, new ValueEntry(value, expiresAt));
                 out.write("+OK\r\n".getBytes());
                 out.flush();
-                System.out.println("[" + Thread.currentThread().getName() + "] Handled SET " + key + " = " + value);
+                String ttlLog = (expiresAt != null) ? " (expires in " + (expiresAt - System.currentTimeMillis()) + "ms)" : "";
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled SET " + key + " = " + value + ttlLog);
             }
             case "GET" -> {
                 String key = tokens.get(1);
-                String value = database.get(key);
-                if (value != null) {
-                    // Key found: return Bulk String
-                    String response = "$" + value.length() + "\r\n" + value + "\r\n";
+                ValueEntry entry = database.get(key);
+
+                // Passive / Lazy expiration: remove from map if expired
+                if (entry != null && entry.isExpired()) {
+                    database.remove(key);
+                    entry = null;
+                }
+
+                if (entry != null) {
+                    // Key found & active: return Bulk String
+                    String val = entry.value();
+                    String response = "$" + val.length() + "\r\n" + val + "\r\n";
                     out.write(response.getBytes());
-                    System.out.println("[" + Thread.currentThread().getName() + "] Handled GET " + key + " -> " + value);
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled GET " + key + " -> " + val);
                 } else {
-                    // Key not found: return RESP Null Bulk String ($-1\r\n)
+                    // Key not found or expired: return RESP Null Bulk String ($-1\r\n)
                     out.write("$-1\r\n".getBytes());
                     System.out.println("[" + Thread.currentThread().getName() + "] Handled GET " + key + " -> (nil)");
                 }
