@@ -3,6 +3,7 @@ import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Scanner;
+import java.util.concurrent.CompletableFuture;
 
 public class Main {
     public static void main(String[] args) {
@@ -13,30 +14,37 @@ public class Main {
             serverSocket.setReuseAddress(true);
             System.out.println("Redis server listening on port " + port + "...");
 
-            // Wait for connection from client
-            Socket clientSocket = serverSocket.accept();
-            System.out.println("Client connected: " + clientSocket.getRemoteSocketAddress());
+            // Continuously accept new clients in an infinite loop
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("New client connected: " + clientSocket.getRemoteSocketAddress());
 
-            OutputStream out = clientSocket.getOutputStream();
-            Scanner scanner = new Scanner(clientSocket.getInputStream());
+                // Offload each client to a separate thread
+                CompletableFuture.runAsync(() -> handleClient(clientSocket));
+            }
+        } catch (IOException e) {
+            System.out.println("IOException: " + e.getMessage());
+        }
+    }
 
-            // Loop to read multiple commands on the same connection
+    private static void handleClient(Socket clientSocket) {
+        try (clientSocket;
+             OutputStream out = clientSocket.getOutputStream();
+             Scanner scanner = new Scanner(clientSocket.getInputStream())) {
+
             while (scanner.hasNextLine()) {
                 String line = scanner.nextLine();
 
-                // Redis commands are case-insensitive
                 if (line.toUpperCase().contains("PING")) {
                     out.write("+PONG\r\n".getBytes());
                     out.flush();
-                    System.out.println("Handled PING -> Sent +PONG\\r\\n");
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled PING -> Sent +PONG\\r\\n");
                 }
             }
-
-            // Connection ends when the client disconnects
-            System.out.println("Client disconnected.");
-            clientSocket.close();
         } catch (IOException e) {
-            System.out.println("IOException: " + e.getMessage());
+            System.out.println("Client error: " + e.getMessage());
+        } finally {
+            System.out.println("Client disconnected: " + clientSocket.getRemoteSocketAddress());
         }
     }
 }
