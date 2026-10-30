@@ -79,10 +79,11 @@ public class Main {
     private static void handleClient(Socket clientSocket) {
         boolean inTransaction = false;
         List<List<String>> transactionQueue = new ArrayList<>();
+        OutputStream out = null;
 
-        try (clientSocket;
-             OutputStream out = clientSocket.getOutputStream();
-             Scanner scanner = new Scanner(clientSocket.getInputStream())) {
+        try {
+            out = clientSocket.getOutputStream();
+            Scanner scanner = new Scanner(clientSocket.getInputStream());
 
             while (scanner.hasNextLine()) {
                 String line = scanner.nextLine().trim();
@@ -106,17 +107,15 @@ public class Main {
 
                 String command = tokens.get(0).toUpperCase();
 
-                // If the client is a replica sending PSYNC, keep the connection open
-                // and register this output stream for future command propagation
+                // If the client is a replica sending PSYNC, register for propagation
+                // and CONTINUE the loop so the connection remains open
                 if (command.equals("PSYNC")) {
                     String response = executeCommand(tokens);
                     out.write(response.getBytes());
                     out.flush();
-                    // Register this replica's output stream
                     replicaStreams.add(out);
-                    System.out.println("[Master] Replica registered for propagation. Total replicas: " + replicaStreams.size());
-                    // Keep the connection open — do NOT close, just return
-                    return;
+                    System.out.println("[Master] Replica registered for propagation. Total active replicas: " + replicaStreams.size());
+                    continue;
                 }
 
                 // Transaction handling: MULTI, EXEC, DISCARD
@@ -169,6 +168,12 @@ public class Main {
         } catch (Exception e) {
             System.out.println("Client disconnected or error: " + e.getMessage());
         } finally {
+            if (out != null) {
+                replicaStreams.remove(out);
+            }
+            try {
+                clientSocket.close();
+            } catch (IOException ignored) {}
             System.out.println("Client disconnected: " + clientSocket.getRemoteSocketAddress());
         }
     }
@@ -210,6 +215,31 @@ public class Main {
                 String psyncResp = in.nextLine();
                 System.out.println("[Replica Handshake 3/3] Sent PSYNC ? -1 -> Master replied: " + psyncResp);
                 System.out.println("[Replica] === HANDSHAKE SUCCESSFULLY COMPLETED! ===");
+
+                // Continuous loop: listen for commands propagated from Master
+                while (in.hasNextLine()) {
+                    String line = in.nextLine().trim();
+                    if (line.isEmpty()) continue;
+
+                    List<String> tokens = new ArrayList<>();
+                    if (line.startsWith("*")) {
+                        int count = Integer.parseInt(line.substring(1));
+                        for (int i = 0; i < count; i++) {
+                            in.nextLine(); // skip $<length>
+                            tokens.add(in.nextLine()); // token
+                        }
+                    } else {
+                        tokens.addAll(Arrays.asList(line.split("\\s+")));
+                    }
+
+                    if (tokens.isEmpty()) continue;
+
+                    String cmd = tokens.get(0).toUpperCase();
+                    System.out.println("[Replica] Received propagated command: " + cmd + " " + String.join(" ", tokens.subList(1, tokens.size())));
+
+                    // Execute into replica's local database
+                    executeCommand(tokens);
+                }
 
             } catch (Exception e) {
                 System.out.println("[Replica] Handshake error: " + e.getMessage());
@@ -359,6 +389,9 @@ public class Main {
                     }
                 }
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled DEL -> deleted " + deletedCount + " key(s)");
+                if (role.equals("master")) {
+                    propagateToReplicas(tokens);
+                }
                 return ":" + deletedCount + "\r\n";
             }
             case "KEYS" -> {
