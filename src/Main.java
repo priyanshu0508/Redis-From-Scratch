@@ -131,6 +131,53 @@ public class Main {
                 }
                 out.flush();
             }
+            case "EXISTS" -> {
+                String key = tokens.get(1);
+                ValueEntry entry = database.get(key);
+                if (entry != null && entry.isExpired()) {
+                    database.remove(key);
+                    entry = null;
+                }
+                int exists = (entry != null) ? 1 : 0;
+                // RESP Integer format: :<number>\r\n
+                out.write((":" + exists + "\r\n").getBytes());
+                out.flush();
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled EXISTS " + key + " -> " + exists);
+            }
+            case "DEL" -> {
+                int deletedCount = 0;
+                for (int i = 1; i < tokens.size(); i++) {
+                    String key = tokens.get(i);
+                    ValueEntry removed = database.remove(key);
+                    if (removed != null && !removed.isExpired()) {
+                        deletedCount++;
+                    }
+                }
+                // RESP Integer format: :<count>\r\n
+                out.write((":" + deletedCount + "\r\n").getBytes());
+                out.flush();
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled DEL -> deleted " + deletedCount + " key(s)");
+            }
+            case "KEYS" -> {
+                // Purge expired keys and gather active keys
+                List<String> activeKeys = new ArrayList<>();
+                for (Map.Entry<String, ValueEntry> e : database.entrySet()) {
+                    if (e.getValue().isExpired()) {
+                        database.remove(e.getKey());
+                    } else {
+                        activeKeys.add(e.getKey());
+                    }
+                }
+                // RESP Array of Bulk Strings format: *<count>\r\n$<len>\r\n<key>\r\n...
+                StringBuilder resp = new StringBuilder();
+                resp.append("*").append(activeKeys.size()).append("\r\n");
+                for (String k : activeKeys) {
+                    resp.append("$").append(k.length()).append("\r\n").append(k).append("\r\n");
+                }
+                out.write(resp.toString().getBytes());
+                out.flush();
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled KEYS -> returned " + activeKeys.size() + " key(s)");
+            }
             default -> {
                 String error = "-ERR unknown command '" + command + "'\r\n";
                 out.write(error.getBytes());
