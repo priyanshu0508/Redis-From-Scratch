@@ -2,6 +2,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.Scanner;
 
 public class Main {
     public static void main(String[] args) {
@@ -16,18 +17,24 @@ public class Main {
             Socket clientSocket = serverSocket.accept();
             System.out.println("Client connected: " + clientSocket.getRemoteSocketAddress());
 
-            // Get the output stream to send data back to the client
             OutputStream out = clientSocket.getOutputStream();
+            Scanner scanner = new Scanner(clientSocket.getInputStream());
 
-            // Send '+PONG\r\n' (RESP simple string format)
-            String pongResponse = "+PONG\r\n";
-            out.write(pongResponse.getBytes());
-            out.flush();
-            System.out.println("Sent: +PONG\\r\\n");
+            // Loop to read multiple commands on the same connection
+            while (scanner.hasNextLine()) {
+                String line = scanner.nextLine();
 
-            // Close connection
+                // Redis commands are case-insensitive
+                if (line.toUpperCase().contains("PING")) {
+                    out.write("+PONG\r\n".getBytes());
+                    out.flush();
+                    System.out.println("Handled PING -> Sent +PONG\\r\\n");
+                }
+            }
+
+            // Connection ends when the client disconnects
+            System.out.println("Client disconnected.");
             clientSocket.close();
-            System.out.println("Client connection closed.");
         } catch (IOException e) {
             System.out.println("IOException: " + e.getMessage());
         }
