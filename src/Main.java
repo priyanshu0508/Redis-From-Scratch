@@ -21,9 +21,24 @@ public class Main {
     // Thread-safe in-memory key-value database supporting TTL expiration
     private static final Map<String, ValueEntry> database = new ConcurrentHashMap<>();
 
+    // Server configuration parameters (default values can be overridden via CLI flags)
+    private static String dir = "/tmp/redis-data";
+    private static String dbfilename = "dump.rdb";
+
     public static void main(String[] args) {
         int port = 6379;
+
+        // Parse CLI arguments: --dir <directory> --dbfilename <filename>
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equalsIgnoreCase("--dir") && i + 1 < args.length) {
+                dir = args[++i];
+            } else if (args[i].equalsIgnoreCase("--dbfilename") && i + 1 < args.length) {
+                dbfilename = args[++i];
+            }
+        }
+
         System.out.println("Logs from your program will appear here!");
+        System.out.println("Configuration: dir = " + dir + ", dbfilename = " + dbfilename);
 
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             serverSocket.setReuseAddress(true);
@@ -177,6 +192,29 @@ public class Main {
                 out.write(resp.toString().getBytes());
                 out.flush();
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled KEYS -> returned " + activeKeys.size() + " key(s)");
+            }
+            case "CONFIG" -> {
+                // Handles 'CONFIG GET <parameter>'
+                if (tokens.size() >= 3 && tokens.get(1).equalsIgnoreCase("GET")) {
+                    String param = tokens.get(2).toLowerCase();
+                    String val = "";
+                    if (param.equals("dir")) {
+                        val = dir;
+                    } else if (param.equals("dbfilename")) {
+                        val = dbfilename;
+                    }
+
+                    // Return 2-element RESP Array: [parameter_name, parameter_value]
+                    String response = "*2\r\n" +
+                            "$" + param.length() + "\r\n" + param + "\r\n" +
+                            "$" + val.length() + "\r\n" + val + "\r\n";
+                    out.write(response.getBytes());
+                    out.flush();
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled CONFIG GET " + param + " -> " + val);
+                } else {
+                    out.write("-ERR unsupported CONFIG subcommand\r\n".getBytes());
+                    out.flush();
+                }
             }
             default -> {
                 String error = "-ERR unknown command '" + command + "'\r\n";
