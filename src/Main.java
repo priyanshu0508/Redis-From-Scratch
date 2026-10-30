@@ -36,6 +36,9 @@ public class Main {
     // Thread-safe in-memory hash database for HSET, HGET, HGETALL
     private static final Map<String, Map<String, String>> hashDatabase = new ConcurrentHashMap<>();
 
+    // Thread-safe in-memory set database for SADD, SMEMBERS, SISMEMBER
+    private static final Map<String, Set<String>> setDatabase = new ConcurrentHashMap<>();
+
     // Pub/Sub: channel name -> Set of active subscriber OutputStreams
     private static final Map<String, Set<OutputStream>> channelSubscribers = new ConcurrentHashMap<>();
 
@@ -426,7 +429,7 @@ public class Main {
                     database.remove(key);
                     entry = null;
                 }
-                int exists = (entry != null || listDatabase.containsKey(key) || hashDatabase.containsKey(key)) ? 1 : 0;
+                int exists = (entry != null || listDatabase.containsKey(key) || hashDatabase.containsKey(key) || setDatabase.containsKey(key)) ? 1 : 0;
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled EXISTS " + key + " -> " + exists);
                 return ":" + exists + "\r\n";
             }
@@ -442,6 +445,9 @@ public class Main {
                         deletedCount++;
                     }
                     if (hashDatabase.remove(key) != null) {
+                        deletedCount++;
+                    }
+                    if (setDatabase.remove(key) != null) {
                         deletedCount++;
                     }
                 }
@@ -460,9 +466,10 @@ public class Main {
                         activeKeys.add(e.getKey());
                     }
                 }
-                // Add keys from listDatabase and hashDatabase
+                // Add keys from listDatabase, hashDatabase, and setDatabase
                 activeKeys.addAll(listDatabase.keySet());
                 activeKeys.addAll(hashDatabase.keySet());
+                activeKeys.addAll(setDatabase.keySet());
 
                 StringBuilder resp = new StringBuilder();
                 resp.append("*").append(activeKeys.size()).append("\r\n");
@@ -634,6 +641,39 @@ public class Main {
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled PUBLISH " + channel + " -> delivered to " + deliveredCount + " subscriber(s)");
                 return ":" + deliveredCount + "\r\n";
             }
+            case "SADD" -> {
+                String key = tokens.get(1);
+                Set<String> set = setDatabase.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
+                int added = 0;
+                for (int i = 2; i < tokens.size(); i++) {
+                    if (set.add(tokens.get(i))) added++;
+                }
+                if (role.equals("master")) propagateToReplicas(tokens);
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled SADD " + key + " -> added " + added + " member(s), total " + set.size());
+                return ":" + added + "\r\n";
+            }
+            case "SMEMBERS" -> {
+                String key = tokens.get(1);
+                Set<String> set = setDatabase.get(key);
+                if (set == null || set.isEmpty()) {
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled SMEMBERS " + key + " -> (empty)");
+                    return "*0\r\n";
+                }
+                StringBuilder resp = new StringBuilder("*").append(set.size()).append("\r\n");
+                for (String member : set) {
+                    resp.append("$").append(member.length()).append("\r\n").append(member).append("\r\n");
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled SMEMBERS " + key + " -> " + set.size() + " member(s)");
+                return resp.toString();
+            }
+            case "SISMEMBER" -> {
+                String key = tokens.get(1);
+                String member = tokens.get(2);
+                Set<String> set = setDatabase.get(key);
+                int found = (set != null && set.contains(member)) ? 1 : 0;
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled SISMEMBER " + key + " " + member + " -> " + found);
+                return ":" + found + "\r\n";
+            }
             default -> {
                 return "-ERR unknown command '" + command + "'\r\n";
             }
@@ -692,7 +732,18 @@ public class Main {
                     }
                 }
 
-                // 5. EOF marker
+                // 5. Save Sets
+                dos.writeInt(setDatabase.size());
+                for (Map.Entry<String, Set<String>> e : setDatabase.entrySet()) {
+                    dos.writeUTF(e.getKey());
+                    List<String> members = new ArrayList<>(e.getValue());
+                    dos.writeInt(members.size());
+                    for (String member : members) {
+                        dos.writeUTF(member);
+                    }
+                }
+
+                // 6. EOF marker
                 dos.writeByte(0xFF);
                 dos.flush();
                 System.out.println("[Persistence] Snapshot successfully saved to " + targetFile.getAbsolutePath());
@@ -758,8 +809,20 @@ public class Main {
                 hashDatabase.put(key, map);
             }
 
+            // 4. Restore Sets
+            int setCount = dis.readInt();
+            for (int i = 0; i < setCount; i++) {
+                String key = dis.readUTF();
+                int memberCount = dis.readInt();
+                Set<String> set = ConcurrentHashMap.newKeySet();
+                for (int j = 0; j < memberCount; j++) {
+                    set.add(dis.readUTF());
+                }
+                setDatabase.put(key, set);
+            }
+
             System.out.println("[Persistence] Successfully restored from " + sourceFile.getAbsolutePath() +
-                    " (" + restoredStrings + " strings, " + listCount + " lists, " + hashCount + " hashes)");
+                    " (" + restoredStrings + " strings, " + listCount + " lists, " + hashCount + " hashes, " + setCount + " sets)");
         } catch (Exception e) {
             System.out.println("[Persistence] Could not load RDB file: " + e.getMessage());
         }
