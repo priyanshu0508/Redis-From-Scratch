@@ -22,23 +22,37 @@ public class Main {
     private static final Map<String, ValueEntry> database = new ConcurrentHashMap<>();
 
     // Server configuration parameters (default values can be overridden via CLI flags)
+    private static int port = 6379;
     private static String dir = "/tmp/redis-data";
     private static String dbfilename = "dump.rdb";
 
-    public static void main(String[] args) {
-        int port = 6379;
+    // Replication metadata
+    private static String role = "master";
+    private static String masterHost = null;
+    private static int masterPort = 0;
+    private static final String masterReplId = "8371b4fb1155b71f4a04d3b1bc3e18c50f415a69";
+    private static final int masterReplOffset = 0;
 
-        // Parse CLI arguments: --dir <directory> --dbfilename <filename>
+    public static void main(String[] args) {
+        // Parse CLI arguments: --port <port> --dir <dir> --dbfilename <file> --replicaof "<host> <port>"
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equalsIgnoreCase("--dir") && i + 1 < args.length) {
+            if (args[i].equalsIgnoreCase("--port") && i + 1 < args.length) {
+                port = Integer.parseInt(args[++i]);
+            } else if (args[i].equalsIgnoreCase("--dir") && i + 1 < args.length) {
                 dir = args[++i];
             } else if (args[i].equalsIgnoreCase("--dbfilename") && i + 1 < args.length) {
                 dbfilename = args[++i];
+            } else if (args[i].equalsIgnoreCase("--replicaof") && i + 1 < args.length) {
+                role = "slave";
+                String replicaArg = args[++i];
+                String[] parts = replicaArg.split("\\s+");
+                masterHost = parts[0];
+                masterPort = Integer.parseInt(parts[1]);
             }
         }
 
         System.out.println("Logs from your program will appear here!");
-        System.out.println("Configuration: dir = " + dir + ", dbfilename = " + dbfilename);
+        System.out.println("Configuration: port = " + port + ", role = " + role + ", dir = " + dir + ", dbfilename = " + dbfilename);
 
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             serverSocket.setReuseAddress(true);
@@ -145,6 +159,18 @@ public class Main {
             case "PING" -> {
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled PING -> +PONG");
                 return "+PONG\r\n";
+            }
+            case "INFO" -> {
+                // Replication info returned as a RESP Bulk String
+                StringBuilder info = new StringBuilder();
+                info.append("role:").append(role).append("\r\n");
+                if (role.equals("master")) {
+                    info.append("master_replid:").append(masterReplId).append("\r\n");
+                    info.append("master_repl_offset:").append(masterReplOffset).append("\r\n");
+                }
+                String infoStr = info.toString();
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled INFO replication -> role:" + role);
+                return "$" + infoStr.length() + "\r\n" + infoStr + "\r\n";
             }
             case "ECHO" -> {
                 String message = tokens.get(1);
