@@ -13,6 +13,7 @@ A production-grade, multithreaded, in-memory key-value database and data structu
   - **Strings**: `SET`, `GET`, `INCR`, `EXISTS`, `DEL`, `KEYS *`
   - **Lists**: `LPUSH`, `RPUSH`, `LRANGE`
   - **Hashes**: `HSET`, `HGET`, `HGETALL`
+- **Pub/Sub Messaging**: Real-time event broadcasting via `SUBSCRIBE` and `PUBLISH`.
 - **Transactions**: `MULTI`, `EXEC`, `DISCARD` with per-client command queuing.
 - **Distributed Replication**:
   - Role management (`master` vs `slave`) via `INFO replication`.
@@ -52,6 +53,7 @@ A production-grade, multithreaded, in-memory key-value database and data structu
 | **Key Management** | `EXISTS <key>`, `DEL <key ...>`, `KEYS *` |
 | **Lists** | `LPUSH <key> <val ...>`, `RPUSH <key> <val ...>`, `LRANGE <key> <start> <stop>` |
 | **Hashes** | `HSET <key> <f1> <v1> ...`, `HGET <key> <f>`, `HGETALL <key>` |
+| **Pub/Sub** | `SUBSCRIBE <channel ...>`, `PUBLISH <channel> <message>` |
 | **Transactions** | `MULTI`, `EXEC`, `DISCARD` |
 | **Replication** | `INFO replication`, `REPLCONF`, `PSYNC` |
 | **Persistence** | `SAVE` |
