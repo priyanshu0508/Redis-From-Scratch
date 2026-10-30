@@ -39,6 +39,21 @@ public class Main {
                     out.write("+PONG\r\n".getBytes());
                     out.flush();
                     System.out.println("[" + Thread.currentThread().getName() + "] Handled PING -> Sent +PONG\\r\\n");
+                } else if (line.trim().equalsIgnoreCase("ECHO")) {
+                    // RESP Array format: the next lines are $<length> followed by the argument payload
+                    String lengthHeader = scanner.nextLine();
+                    String argument = scanner.nextLine();
+                    String respResponse = "$" + argument.length() + "\r\n" + argument + "\r\n";
+                    out.write(respResponse.getBytes());
+                    out.flush();
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled ECHO -> Sent: " + argument);
+                } else if (line.toUpperCase().startsWith("ECHO ")) {
+                    // Simple inline format (e.g., 'ECHO strawberry')
+                    String argument = line.substring(5).trim();
+                    String respResponse = "$" + argument.length() + "\r\n" + argument + "\r\n";
+                    out.write(respResponse.getBytes());
+                    out.flush();
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled ECHO -> Sent: " + argument);
                 }
             }
         } catch (IOException e) {
