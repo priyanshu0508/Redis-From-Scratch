@@ -55,6 +55,9 @@ public class Main {
     }
 
     private static void handleClient(Socket clientSocket) {
+        boolean inTransaction = false;
+        List<List<String>> transactionQueue = new ArrayList<>();
+
         try (clientSocket;
              OutputStream out = clientSocket.getOutputStream();
              Scanner scanner = new Scanner(clientSocket.getInputStream())) {
@@ -73,12 +76,60 @@ public class Main {
                         tokens.add(scanner.nextLine()); // Read the actual argument string
                     }
                 } else {
-                    // Simple inline commands (e.g. "PING", "ECHO hello", "SET k v", "GET k")
+                    // Simple inline commands (e.g. "PING", "MULTI", "EXEC", etc.)
                     tokens.addAll(Arrays.asList(line.split("\\s+")));
                 }
 
                 if (tokens.isEmpty()) continue;
-                processCommand(tokens, out);
+
+                String command = tokens.get(0).toUpperCase();
+
+                // Transaction handling: MULTI, EXEC, DISCARD
+                if (command.equals("MULTI")) {
+                    inTransaction = true;
+                    transactionQueue.clear();
+                    out.write("+OK\r\n".getBytes());
+                    out.flush();
+                    System.out.println("[" + Thread.currentThread().getName() + "] Transaction started (MULTI)");
+                } else if (command.equals("DISCARD")) {
+                    if (!inTransaction) {
+                        out.write("-ERR DISCARD without MULTI\r\n".getBytes());
+                    } else {
+                        inTransaction = false;
+                        transactionQueue.clear();
+                        out.write("+OK\r\n".getBytes());
+                        System.out.println("[" + Thread.currentThread().getName() + "] Transaction discarded (DISCARD)");
+                    }
+                    out.flush();
+                } else if (command.equals("EXEC")) {
+                    if (!inTransaction) {
+                        out.write("-ERR EXEC without MULTI\r\n".getBytes());
+                    } else {
+                        inTransaction = false;
+                        // Return RESP Array with results of all queued commands
+                        StringBuilder execResp = new StringBuilder();
+                        execResp.append("*").append(transactionQueue.size()).append("\r\n");
+                        for (List<String> queuedCmd : transactionQueue) {
+                            execResp.append(executeCommand(queuedCmd));
+                        }
+                        transactionQueue.clear();
+                        out.write(execResp.toString().getBytes());
+                        System.out.println("[" + Thread.currentThread().getName() + "] Executed transaction block (EXEC)");
+                    }
+                    out.flush();
+                } else {
+                    // Regular command: queue if in transaction, else execute immediately
+                    if (inTransaction) {
+                        transactionQueue.add(tokens);
+                        out.write("+QUEUED\r\n".getBytes());
+                        out.flush();
+                        System.out.println("[" + Thread.currentThread().getName() + "] Queued: " + command);
+                    } else {
+                        String response = executeCommand(tokens);
+                        out.write(response.getBytes());
+                        out.flush();
+                    }
+                }
             }
         } catch (Exception e) {
             System.out.println("Client disconnected or error: " + e.getMessage());
@@ -87,21 +138,18 @@ public class Main {
         }
     }
 
-    private static void processCommand(List<String> tokens, OutputStream out) throws IOException {
+    private static String executeCommand(List<String> tokens) {
         String command = tokens.get(0).toUpperCase();
 
         switch (command) {
             case "PING" -> {
-                out.write("+PONG\r\n".getBytes());
-                out.flush();
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled PING -> +PONG");
+                return "+PONG\r\n";
             }
             case "ECHO" -> {
                 String message = tokens.get(1);
-                String response = "$" + message.length() + "\r\n" + message + "\r\n";
-                out.write(response.getBytes());
-                out.flush();
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled ECHO -> " + message);
+                return "$" + message.length() + "\r\n" + message + "\r\n";
             }
             case "SET" -> {
                 String key = tokens.get(1);
@@ -118,33 +166,48 @@ public class Main {
                 }
 
                 database.put(key, new ValueEntry(value, expiresAt));
-                out.write("+OK\r\n".getBytes());
-                out.flush();
                 String ttlLog = (expiresAt != null) ? " (expires in " + (expiresAt - System.currentTimeMillis()) + "ms)" : "";
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled SET " + key + " = " + value + ttlLog);
+                return "+OK\r\n";
             }
             case "GET" -> {
                 String key = tokens.get(1);
                 ValueEntry entry = database.get(key);
 
-                // Passive / Lazy expiration: remove from map if expired
+                // Passive / Lazy expiration
                 if (entry != null && entry.isExpired()) {
                     database.remove(key);
                     entry = null;
                 }
 
                 if (entry != null) {
-                    // Key found & active: return Bulk String
                     String val = entry.value();
-                    String response = "$" + val.length() + "\r\n" + val + "\r\n";
-                    out.write(response.getBytes());
                     System.out.println("[" + Thread.currentThread().getName() + "] Handled GET " + key + " -> " + val);
+                    return "$" + val.length() + "\r\n" + val + "\r\n";
                 } else {
-                    // Key not found or expired: return RESP Null Bulk String ($-1\r\n)
-                    out.write("$-1\r\n".getBytes());
                     System.out.println("[" + Thread.currentThread().getName() + "] Handled GET " + key + " -> (nil)");
+                    return "$-1\r\n";
                 }
-                out.flush();
+            }
+            case "INCR" -> {
+                String key = tokens.get(1);
+                ValueEntry entry = database.get(key);
+                if (entry != null && entry.isExpired()) {
+                    database.remove(key);
+                    entry = null;
+                }
+                long val = 0;
+                if (entry != null) {
+                    try {
+                        val = Long.parseLong(entry.value());
+                    } catch (NumberFormatException e) {
+                        return "-ERR value is not an integer or out of range\r\n";
+                    }
+                }
+                val++;
+                database.put(key, new ValueEntry(String.valueOf(val), (entry != null) ? entry.expiresAt() : null));
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled INCR " + key + " -> " + val);
+                return ":" + val + "\r\n";
             }
             case "EXISTS" -> {
                 String key = tokens.get(1);
@@ -154,10 +217,8 @@ public class Main {
                     entry = null;
                 }
                 int exists = (entry != null) ? 1 : 0;
-                // RESP Integer format: :<number>\r\n
-                out.write((":" + exists + "\r\n").getBytes());
-                out.flush();
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled EXISTS " + key + " -> " + exists);
+                return ":" + exists + "\r\n";
             }
             case "DEL" -> {
                 int deletedCount = 0;
@@ -168,13 +229,10 @@ public class Main {
                         deletedCount++;
                     }
                 }
-                // RESP Integer format: :<count>\r\n
-                out.write((":" + deletedCount + "\r\n").getBytes());
-                out.flush();
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled DEL -> deleted " + deletedCount + " key(s)");
+                return ":" + deletedCount + "\r\n";
             }
             case "KEYS" -> {
-                // Purge expired keys and gather active keys
                 List<String> activeKeys = new ArrayList<>();
                 for (Map.Entry<String, ValueEntry> e : database.entrySet()) {
                     if (e.getValue().isExpired()) {
@@ -183,18 +241,15 @@ public class Main {
                         activeKeys.add(e.getKey());
                     }
                 }
-                // RESP Array of Bulk Strings format: *<count>\r\n$<len>\r\n<key>\r\n...
                 StringBuilder resp = new StringBuilder();
                 resp.append("*").append(activeKeys.size()).append("\r\n");
                 for (String k : activeKeys) {
                     resp.append("$").append(k.length()).append("\r\n").append(k).append("\r\n");
                 }
-                out.write(resp.toString().getBytes());
-                out.flush();
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled KEYS -> returned " + activeKeys.size() + " key(s)");
+                return resp.toString();
             }
             case "CONFIG" -> {
-                // Handles 'CONFIG GET <parameter>'
                 if (tokens.size() >= 3 && tokens.get(1).equalsIgnoreCase("GET")) {
                     String param = tokens.get(2).toLowerCase();
                     String val = "";
@@ -203,23 +258,16 @@ public class Main {
                     } else if (param.equals("dbfilename")) {
                         val = dbfilename;
                     }
-
-                    // Return 2-element RESP Array: [parameter_name, parameter_value]
-                    String response = "*2\r\n" +
+                    System.out.println("[" + Thread.currentThread().getName() + "] Handled CONFIG GET " + param + " -> " + val);
+                    return "*2\r\n" +
                             "$" + param.length() + "\r\n" + param + "\r\n" +
                             "$" + val.length() + "\r\n" + val + "\r\n";
-                    out.write(response.getBytes());
-                    out.flush();
-                    System.out.println("[" + Thread.currentThread().getName() + "] Handled CONFIG GET " + param + " -> " + val);
                 } else {
-                    out.write("-ERR unsupported CONFIG subcommand\r\n".getBytes());
-                    out.flush();
+                    return "-ERR unsupported CONFIG subcommand\r\n";
                 }
             }
             default -> {
-                String error = "-ERR unknown command '" + command + "'\r\n";
-                out.write(error.getBytes());
-                out.flush();
+                return "-ERR unknown command '" + command + "'\r\n";
             }
         }
     }
