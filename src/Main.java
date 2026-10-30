@@ -21,6 +21,9 @@ public class Main {
     // Thread-safe in-memory key-value database supporting TTL expiration
     private static final Map<String, ValueEntry> database = new ConcurrentHashMap<>();
 
+    // Thread-safe list of all connected replica output streams for command propagation
+    private static final List<OutputStream> replicaStreams = new java.util.concurrent.CopyOnWriteArrayList<>();
+
     // Server configuration parameters (default values can be overridden via CLI flags)
     private static int port = 6379;
     private static String dir = "/tmp/redis-data";
@@ -102,6 +105,19 @@ public class Main {
                 if (tokens.isEmpty()) continue;
 
                 String command = tokens.get(0).toUpperCase();
+
+                // If the client is a replica sending PSYNC, keep the connection open
+                // and register this output stream for future command propagation
+                if (command.equals("PSYNC")) {
+                    String response = executeCommand(tokens);
+                    out.write(response.getBytes());
+                    out.flush();
+                    // Register this replica's output stream
+                    replicaStreams.add(out);
+                    System.out.println("[Master] Replica registered for propagation. Total replicas: " + replicaStreams.size());
+                    // Keep the connection open — do NOT close, just return
+                    return;
+                }
 
                 // Transaction handling: MULTI, EXEC, DISCARD
                 if (command.equals("MULTI")) {
@@ -201,6 +217,36 @@ public class Main {
         });
     }
 
+    /**
+     * Propagates a write command to all connected replicas in RESP Array format.
+     * Called after every successful SET, INCR, DEL on the master.
+     */
+    private static void propagateToReplicas(List<String> tokens) {
+        if (replicaStreams.isEmpty()) return;
+
+        // Encode command as RESP Array
+        StringBuilder resp = new StringBuilder();
+        resp.append("*").append(tokens.size()).append("\r\n");
+        for (String token : tokens) {
+            resp.append("$").append(token.length()).append("\r\n").append(token).append("\r\n");
+        }
+        byte[] encoded = resp.toString().getBytes();
+
+        // Send to every registered replica, clean up dead ones
+        List<OutputStream> dead = new ArrayList<>();
+        for (OutputStream replicaOut : replicaStreams) {
+            try {
+                replicaOut.write(encoded);
+                replicaOut.flush();
+            } catch (IOException e) {
+                System.out.println("[Master] Replica stream dead, removing.");
+                dead.add(replicaOut);
+            }
+        }
+        replicaStreams.removeAll(dead);
+        System.out.println("[Master] Propagated '" + tokens.get(0).toUpperCase() + "' to " + replicaStreams.size() + " replica(s)");
+    }
+
     private static String executeCommand(List<String> tokens) {
         String command = tokens.get(0).toUpperCase();
 
@@ -243,6 +289,10 @@ public class Main {
                 database.put(key, new ValueEntry(value, expiresAt));
                 String ttlLog = (expiresAt != null) ? " (expires in " + (expiresAt - System.currentTimeMillis()) + "ms)" : "";
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled SET " + key + " = " + value + ttlLog);
+                // Propagate SET command to all replicas if we are master
+                if (role.equals("master")) {
+                    propagateToReplicas(tokens);
+                }
                 return "+OK\r\n";
             }
             case "GET" -> {
@@ -282,6 +332,10 @@ public class Main {
                 val++;
                 database.put(key, new ValueEntry(String.valueOf(val), (entry != null) ? entry.expiresAt() : null));
                 System.out.println("[" + Thread.currentThread().getName() + "] Handled INCR " + key + " -> " + val);
+                // Propagate INCR to replicas if we are master
+                if (role.equals("master")) {
+                    propagateToReplicas(tokens);
+                }
                 return ":" + val + "\r\n";
             }
             case "EXISTS" -> {
