@@ -54,6 +54,11 @@ public class Main {
         System.out.println("Logs from your program will appear here!");
         System.out.println("Configuration: port = " + port + ", role = " + role + ", dir = " + dir + ", dbfilename = " + dbfilename);
 
+        // If running as a replica, initiate the handshake with the master server
+        if (role.equals("slave") && masterHost != null) {
+            initiateReplicaHandshake(masterHost, masterPort, port);
+        }
+
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             serverSocket.setReuseAddress(true);
             System.out.println("Redis server listening on port " + port + "...");
@@ -150,6 +155,50 @@ public class Main {
         } finally {
             System.out.println("Client disconnected: " + clientSocket.getRemoteSocketAddress());
         }
+    }
+
+    private static void initiateReplicaHandshake(String host, int masterPort, int replicaPort) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                // Short wait to ensure master is ready
+                Thread.sleep(600);
+                System.out.println("[Replica] Connecting to master at " + host + ":" + masterPort + "...");
+                Socket masterSocket = new Socket(host, masterPort);
+                OutputStream out = masterSocket.getOutputStream();
+                Scanner in = new Scanner(masterSocket.getInputStream());
+
+                // Handshake 1: Send PING
+                out.write("*1\r\n$4\r\nPING\r\n".getBytes());
+                out.flush();
+                String pingResp = in.nextLine();
+                System.out.println("[Replica Handshake 1/3] Sent PING -> Master replied: " + pingResp);
+
+                // Handshake 2: Send REPLCONF listening-port <replicaPort>
+                String portStr = String.valueOf(replicaPort);
+                String conf1 = "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$" + portStr.length() + "\r\n" + portStr + "\r\n";
+                out.write(conf1.getBytes());
+                out.flush();
+                String confResp1 = in.nextLine();
+
+                // Send REPLCONF capa psync2
+                String conf2 = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
+                out.write(conf2.getBytes());
+                out.flush();
+                String confResp2 = in.nextLine();
+                System.out.println("[Replica Handshake 2/3] Sent REPLCONF -> Master replied: " + confResp1 + " and " + confResp2);
+
+                // Handshake 3: Send PSYNC ? -1
+                String psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+                out.write(psync.getBytes());
+                out.flush();
+                String psyncResp = in.nextLine();
+                System.out.println("[Replica Handshake 3/3] Sent PSYNC ? -1 -> Master replied: " + psyncResp);
+                System.out.println("[Replica] === HANDSHAKE SUCCESSFULLY COMPLETED! ===");
+
+            } catch (Exception e) {
+                System.out.println("[Replica] Handshake error: " + e.getMessage());
+            }
+        });
     }
 
     private static String executeCommand(List<String> tokens) {
@@ -291,6 +340,14 @@ public class Main {
                 } else {
                     return "-ERR unsupported CONFIG subcommand\r\n";
                 }
+            }
+            case "REPLCONF" -> {
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled REPLCONF -> +OK");
+                return "+OK\r\n";
+            }
+            case "PSYNC" -> {
+                System.out.println("[" + Thread.currentThread().getName() + "] Handled PSYNC -> +FULLRESYNC " + masterReplId + " 0");
+                return "+FULLRESYNC " + masterReplId + " 0\r\n";
             }
             default -> {
                 return "-ERR unknown command '" + command + "'\r\n";
